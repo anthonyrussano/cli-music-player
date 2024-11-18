@@ -1,18 +1,21 @@
 # music_player.ps1
 
+# Full path to mpv.exe
+$mpvPath = "mpv.exe"  # Replace with the full path if mpv.exe is not in your PATH
+
 # Path for the mpv IPC named pipe
 $PipeName = "\\.\pipe\mpvsocket"
 
 # Default playlist
-$Global:CurrentPlaylist = "playlist.txt"
+$Script:CurrentPlaylist = "playlist.txt"
 
-# Function to start mpv with the given playlist
+# Function definitions
 function Start-Mpv {
     param(
         [string]$Playlist
     )
     if (-not $Playlist) {
-        $Playlist = $Global:CurrentPlaylist
+        $Playlist = $Script:CurrentPlaylist
     }
 
     if (-not (Test-Path $Playlist)) {
@@ -20,14 +23,32 @@ function Start-Mpv {
         return
     }
 
-    # Start mpv with IPC server
-    Start-Process -FilePath "mpv.exe" `
-        -ArgumentList "--no-video", "--really-quiet", "--input-ipc-server=$PipeName", "--playlist=$Playlist" `
+    # Extract URLs from the playlist
+    $PlaylistEntries = Get-Content $Playlist
+    $Urls = @()
+    foreach ($Entry in $PlaylistEntries) {
+        $Parts = $Entry -split '\s*\|\s*'
+        if ($Parts.Count -ge 2) {
+            $Urls += $Parts[1]
+        }
+    }
+
+    if (-not $Urls) {
+        Write-Host "No valid URLs found in the playlist."
+        return
+    }
+
+    # Save URLs to a temporary file
+    $TempPlaylist = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "current_playlist.txt")
+    $Urls | Set-Content $TempPlaylist
+
+    # Start mpv with IPC server and the playlist
+    Start-Process -FilePath $mpvPath `
+        -ArgumentList "--no-video", "--really-quiet", "--input-ipc-server=$PipeName", "--playlist=$TempPlaylist" `
         -WindowStyle Hidden
     Start-Sleep -Seconds 1
 }
 
-# Function to send a command to mpv via IPC
 function Send-MpvCommand {
     param(
         [hashtable]$Command
@@ -52,7 +73,6 @@ function Send-MpvCommand {
     }
 }
 
-# Function to get a property from mpv
 function Get-MpvProperty {
     param(
         [string]$Property
@@ -66,22 +86,20 @@ function Get-MpvProperty {
     }
 }
 
-# Function to ensure mpv is running
 function Ensure-PlayerRunning {
     if (-not (Get-Process -Name mpv -ErrorAction SilentlyContinue)) {
         Start-Mpv
     }
 }
 
-# Function to list songs in the current playlist
 function List-Songs {
-    if (-not (Test-Path $Global:CurrentPlaylist)) {
-        Write-Host "Playlist not found: $Global:CurrentPlaylist"
+    if (-not (Test-Path $Script:CurrentPlaylist)) {
+        Write-Host "Playlist not found: $Script:CurrentPlaylist"
         return
     }
 
     $Index = 1
-    Get-Content $Global:CurrentPlaylist | ForEach-Object {
+    Get-Content $Script:CurrentPlaylist | ForEach-Object {
         $Parts = $_ -split '\s*\|\s*'
         $Label = $Parts[0]
         Write-Host "$Index. $Label"
@@ -89,19 +107,18 @@ function List-Songs {
     }
 }
 
-# Function to play a specific song by number or label
 function Play-Song {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Search
     )
 
-    if (-not (Test-Path $Global:CurrentPlaylist)) {
-        Write-Host "Playlist not found: $Global:CurrentPlaylist"
+    if (-not (Test-Path $Script:CurrentPlaylist)) {
+        Write-Host "Playlist not found: $Script:CurrentPlaylist"
         return
     }
 
-    $Playlist = Get-Content $Global:CurrentPlaylist
+    $Playlist = Get-Content $Script:CurrentPlaylist
     $SongLine = $null
 
     if ($Search -match '^\d+$') {
@@ -138,36 +155,54 @@ function Play-Song {
     Write-Host "Playing: $Label"
 }
 
-# Function to play the entire playlist
 function Play-Playlist {
-    Ensure-PlayerRunning
-    Write-Host "Playing playlist: $Global:CurrentPlaylist"
+    # Stop mpv if running
+    Get-Process -Name mpv -ErrorAction SilentlyContinue | Stop-Process -Force
+
+    Start-Mpv
+    Write-Host "Playing playlist: $Script:CurrentPlaylist"
 }
 
-# Function to shuffle and play the playlist
 function Shuffle-Play {
-    if (-not (Test-Path $Global:CurrentPlaylist)) {
-        Write-Host "Playlist not found: $Global:CurrentPlaylist"
+    if (-not (Test-Path $Script:CurrentPlaylist)) {
+        Write-Host "Playlist not found: $Script:CurrentPlaylist"
         return
     }
 
     # Stop mpv if running
     Get-Process -Name mpv -ErrorAction SilentlyContinue | Stop-Process -Force
 
-    # Shuffle playlist
-    $Playlist = Get-Content $Global:CurrentPlaylist
-    $ShuffledPlaylist = $Playlist | Get-Random -Count ($Playlist.Count)
+    # Read the playlist and extract URLs
+    $PlaylistEntries = Get-Content $Script:CurrentPlaylist
+    $Urls = @()
+    foreach ($Entry in $PlaylistEntries) {
+        $Parts = $Entry -split '\s*\|\s*'
+        if ($Parts.Count -ge 2) {
+            $Urls += $Parts[1]
+        }
+    }
 
-    # Save shuffled playlist to a temporary file
+    if (-not $Urls) {
+        Write-Host "No valid URLs found in the playlist."
+        return
+    }
+
+    # Shuffle URLs
+    $ShuffledUrls = $Urls | Get-Random -Count ($Urls.Count)
+
+    # Save shuffled URLs to a temporary file
     $TempPlaylist = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "shuffled_playlist.txt")
-    $ShuffledPlaylist | Set-Content $TempPlaylist
+    $ShuffledUrls | Set-Content $TempPlaylist
 
     # Start mpv with the shuffled playlist
-    Start-Process -FilePath "mpv.exe" -ArgumentList "--no-video", "--really-quiet", "--input-ipc-server=$PipeName", "--playlist=$TempPlaylist" -WindowStyle Hidden
+    Start-Process -FilePath $mpvPath `
+        -ArgumentList "--no-video", "--really-quiet", "--input-ipc-server=$PipeName", "--playlist=$TempPlaylist" `
+        -WindowStyle Hidden
+
     Write-Host "Shuffled playlist started."
 }
 
-# Function to switch to a different playlist
+
 function Switch-Playlist {
     param(
         [Parameter(Mandatory = $true)]
@@ -179,7 +214,7 @@ function Switch-Playlist {
     }
 
     if (Test-Path $PlaylistName) {
-        $Global:CurrentPlaylist = $PlaylistName
+        $Script:CurrentPlaylist = $PlaylistName
         Write-Host "Switched to playlist: $PlaylistName"
     } else {
         Write-Host "Playlist not found: $PlaylistName"
@@ -187,12 +222,11 @@ function Switch-Playlist {
     }
 }
 
-# Function to list all available playlists
 function List-Playlists {
     $Playlists = Get-ChildItem -Path . -Filter "*.txt"
     Write-Host "Available playlists:"
     foreach ($Playlist in $Playlists) {
-        if ($Playlist.Name -eq $Global:CurrentPlaylist) {
+        if ($Playlist.Name -eq $Script:CurrentPlaylist) {
             Write-Host "* $($Playlist.Name) (current)"
         } else {
             Write-Host "  $($Playlist.Name)"
@@ -200,7 +234,6 @@ function List-Playlists {
     }
 }
 
-# Function to toggle play/pause
 function Toggle-Pause {
     Ensure-PlayerRunning
     $Command = @{ "command" = @("cycle", "pause") }
@@ -208,7 +241,6 @@ function Toggle-Pause {
     Write-Host "Toggled play/pause."
 }
 
-# Function to skip to the next song
 function Next-Song {
     Ensure-PlayerRunning
     $Command = @{ "command" = @("playlist-next") }
@@ -216,7 +248,6 @@ function Next-Song {
     Write-Host "Skipped to next song."
 }
 
-# Function to go to the previous song
 function Previous-Song {
     Ensure-PlayerRunning
     $Command = @{ "command" = @("playlist-prev") }
@@ -224,7 +255,6 @@ function Previous-Song {
     Write-Host "Went to previous song."
 }
 
-# Function to seek within the current song
 function Seek {
     param(
         [Parameter(Mandatory = $true)]
@@ -236,7 +266,6 @@ function Seek {
     Write-Host "Seeked $Amount seconds."
 }
 
-# Quick seek functions
 function Seek-Forward {
     Seek "+30"
     Write-Host "Skipped forward 30 seconds."
@@ -247,7 +276,6 @@ function Seek-Backward {
     Write-Host "Skipped backward 30 seconds."
 }
 
-# Function to adjust volume
 function Adjust-Volume {
     param(
         [Parameter(Mandatory = $true)]
@@ -259,13 +287,11 @@ function Adjust-Volume {
     Write-Host "Adjusted volume by $Change."
 }
 
-# Function to stop playback
 function Stop-Playback {
     Get-Process -Name mpv -ErrorAction SilentlyContinue | Stop-Process -Force
     Write-Host "Playback stopped."
 }
 
-# Function to show current playback status
 function Show-Status {
     Ensure-PlayerRunning
 
@@ -281,13 +307,11 @@ function Show-Status {
         $DurMinutes = [int]($Duration / 60)
         $DurSeconds = [int]($Duration % 60)
         Write-Host ("[{0}:{1:D2} / {2}:{3:D2}]" -f $PosMinutes, $PosSeconds, $DurMinutes, $DurSeconds)
-
     } else {
         Write-Host "[0:00 / 0:00]"
     }
 }
 
-# Function to show live updating status
 function Show-LiveStatus {
     Ensure-PlayerRunning
     Write-Host "Press 'q' to exit live status."
@@ -316,7 +340,6 @@ function Show-LiveStatus {
                 $DurSeconds = [int]($Duration % 60)
                 Write-Host ("[{0}:{1:D2} / {2}:{3:D2}]" -f $PosMinutes, $PosSeconds, $DurMinutes, $DurSeconds)
 
-
                 # Create progress bar
                 $Width = 50
                 $Progress = [int](($Position / $Duration) * $Width)
@@ -335,7 +358,6 @@ function Show-LiveStatus {
     }
 }
 
-# Function to show help
 function Show-Help {
     @"
 Music Player Commands:
@@ -371,18 +393,18 @@ Tips:
 - You can use partial matches for song labels
 
 Examples:
-  List-Songs                       # List available songs
-  Play-Song 3                      # Play the third song
-  Play-Song "Drake"                # Play first matching song
-  Shuffle-Play                     # Play playlist in random order
-  Seek "+30"                       # Skip forward 30 seconds
-  Show-Status                      # Show current track info
-  Switch-Playlist "rock"           # Switch to rock.txt playlist
-  Adjust-Volume +10                # Increase volume
+  .\music_player.ps1 List-Songs                     # List available songs
+  .\music_player.ps1 Play-Song 3                    # Play the third song
+  .\music_player.ps1 Play-Song "Drake"              # Play first matching song
+  .\music_player.ps1 Shuffle-Play                   # Play playlist in random order
+  .\music_player.ps1 Seek "+30"                     # Skip forward 30 seconds
+  .\music_player.ps1 Show-Status                    # Show current track info
+  .\music_player.ps1 Switch-Playlist "rock"         # Switch to rock.txt playlist
+  .\music_player.ps1 Adjust-Volume +10              # Increase volume
 "@
 }
 
-# Aliases for quick commands
+# Aliases for quick commands (optional, if you still want to source the script)
 Set-Alias px Play-Song
 Set-Alias pn Next-Song
 Set-Alias pp Previous-Song
@@ -397,5 +419,71 @@ Set-Alias psl List-Playlists
 Set-Alias pf Seek-Forward
 Set-Alias pb Seek-Backward
 Set-Alias plv Show-LiveStatus
+
+# Command-line parsing
+if ($args.Count -gt 0) {
+    $command = $args[0]
+    $params = $args[1..($args.Count - 1)]
+
+    switch ($command.ToLower()) {
+        "play-song" {
+            Play-Song @params
+        }
+        "play-playlist" {
+            Play-Playlist
+        }
+        "shuffle-play" {
+            Shuffle-Play
+        }
+        "next-song" {
+            Next-Song
+        }
+        "previous-song" {
+            Previous-Song
+        }
+        "toggle-pause" {
+            Toggle-Pause
+        }
+        "stop-playback" {
+            Stop-Playback
+        }
+        "seek" {
+            Seek @params
+        }
+        "seek-forward" {
+            Seek-Forward
+        }
+        "seek-backward" {
+            Seek-Backward
+        }
+        "adjust-volume" {
+            Adjust-Volume @params
+        }
+        "show-status" {
+            Show-Status
+        }
+        "show-livestatus" {
+            Show-LiveStatus
+        }
+        "list-songs" {
+            List-Songs
+        }
+        "switch-playlist" {
+            Switch-Playlist @params
+        }
+        "list-playlists" {
+            List-Playlists
+        }
+        "show-help" {
+            Show-Help
+        }
+        default {
+            Write-Host "Unknown command: $command"
+            Show-Help
+        }
+    }
+} else {
+    Show-Help
+}
 
 # End of music_player.ps1
