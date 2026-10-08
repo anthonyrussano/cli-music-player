@@ -1,0 +1,25 @@
+# Example library for the `music` CLI. Copy to library.yaml (or let
+# `music add URL` create it). Albums play front to back; songs stand alone.
+
+settings:
+  mpv_args: [--ao=pulse]   # optional extra mpv flags
+  volume: 80               # optional starting volume
+  music_dir: /mnt/c/dev/music   # optional: where downloaded songs are kept
+
+albums:
+  - title: The Gettin' Off Stage, Step 2
+    artist: People Under The Stairs
+    year: 2016
+    url: https://www.youtube.com/playlist?list=OLAK5uy_n3hzWL4YDrVBv1fVtpv9HbhkpRnwWbIbw
+    tracks:
+      - title: Back from the Dead
+        url: https://www.youtube.com/watch?v=zK_-8YpVxkg
+        duration: 369
+      - title: Graffiti on a High School Wall
+        url: https://www.youtube.com/watch?v=71i8VSExOKY
+      # ...
+
+songs:
+  - title: Never Gonna Give You Up
+    artist: Rick Astley
+    url: https://www.youtube.com/watch?v=dQw4w9WgXcQ

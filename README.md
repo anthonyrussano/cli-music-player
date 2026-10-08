@@ -1,153 +1,289 @@
 # Command Line Music Player
 
-A true hacker must never touch the mouse. This script provides terminal commands that emulate a Spotify-like music player. Songs are saved as YouTube links in txt files. Each txt file is a playlist.
+`music` plays YouTube albums and playlists from your terminal using `mpv` and
+`yt-dlp`. Paste a link into the interactive CLI to save the playlist, download
+its audio in the background, and start playing as soon as the first song is
+ready. The rest downloads while you listen. Your library lives in one YAML file.
+
+Every song is kept in a music folder (`/mnt/c/dev/music` by default), named
+`Artist - Album (Year)/01 - Title [id].m4a`. Songs you have heard once play
+instantly afterwards, and other music players can use the same files. To only
+download, without playing:
+
+```bash
+uv run music -dl 'https://www.youtube.com/playlist?list=OLAK5uy_...'
+```
+
+## Paste a playlist and play
+
+Run `./music` (or `music` if installed), then paste your URL at the prompt:
+
+```text
+music › https://www.youtube.com/watch?v=JaTuWOh_0g4&list=PLbmTrF3K6gB1q26lgBX8a_7MbR_GZEwFu
+```
+
+A link containing both a video and a playlist loads the **entire playlist**.
+It opens a full-screen view showing the active song, playback progress, and
+every track's download status. Use **↑/↓** to browse and **Enter** to play the
+selected song. Longer playlists scroll; **PgUp/PgDn** and **Home/End** reach
+the rest. Browsing leaves the current song playing until you press Enter.
+Selecting a song that is still queued prioritizes its download after the
+current download finishes; the current song keeps playing until it is ready.
+
+Press **a** in the view to paste another link, or **q** to return to the command
+prompt. `now` reopens the view. `stop` cancels downloads and stops playback.
+Leaving the shell keeps playback and downloads running.
+
+If audio freezes or shows an output initialization error, press **r** to restart
+audio. Recovery runs in the background and restores the current song, last
+known position, volume, and pause state. The queue and completed downloads are
+reused. If it restores a paused song, press Space to resume.
+
+On WSL this restarts WSLg's shared PulseAudio service, briefly interrupting
+other WSL audio streams, then restarts the player. It does not restart Windows,
+the WSL distributions, or the graphical desktop. Use `restart-audio` at the
+interactive prompt, or `music restart-audio` from another terminal. Use
+`music restart-audio --player-only` to restart mpv alone. On other systems,
+the default restarts mpv alone. Progress and failures appear in the playlist
+view and `status`; diagnostic output is in `audio-restart.log` in the state folder.
+
+For one-shot use, quote the URL:
+
+```bash
+music open 'https://www.youtube.com/watch?v=JaTuWOh_0g4&list=PLbmTrF3K6gB1q26lgBX8a_7MbR_GZEwFu'
+music now
+```
+
+```text
+$ music
+music 2.2.0 — paste a playlist URL or type `help`; Ctrl-D leaves (music keeps playing)
+music › add https://www.youtube.com/playlist?list=OLAK5uy_n3hzWL4YDrVBv1fVtpv9HbhkpRnwWbIbw
+Album: The Gettin' Off Stage, Step 2 (2016) — People Under The Stairs
+   1. Back from the Dead  6:09
+   ...
+Save to library? [Y/n]
+music › play gettin
+▶ The Gettin' Off Stage, Step 2 — People Under The Stairs
+♪ 1/6 Back from the Dead › now
+▶ playing  Back from the Dead — People Under The Stairs
+The Gettin' Off Stage, Step 2  ·  track 1/6  ·  vol 100%
+━━━━━━━━━━●─────────────────────────────────────  1:04 / 6:08
+```
 
 ## Setup
 
-### Prerequisites
 ```bash
-# On macOS with homebrew:
-brew install mpv youtube-dl socat
+# Ubuntu/Debian (WSL included)
+sudo apt install mpv python3-yaml fzf      # fzf is optional (fuzzy album picker)
+# The distro's yt-dlp is usually too old for YouTube; use the standalone release:
+curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/.local/bin/yt-dlp
+chmod +x ~/.local/bin/yt-dlp
 
-# On Ubuntu/Debian:
-sudo apt install mpv youtube-dl socat
+# macOS
+brew install mpv yt-dlp fzf && pip3 install pyyaml
+
+# Put `music` on your PATH
+ln -s "$PWD/music" ~/.local/bin/music
+music doctor                               # checks everything is found
 ```
 
-### Installation
-1. Make the script executable: `chmod +x music_player.sh`
-2. Create a playlist file named `playlist.txt` with format:
-```
-song_label | https://www.youtube.com/watch?v=...
-another_song | https://www.youtube.com/watch?v=...
-```
-3. Source the script: `source music_player.sh`
-4. (Optional) Uncomment the MUSIC\_DIR variable in `music_player.sh` and set it to the absolute path of the music directory if you want to be able to run music commands from anywhere. By default, you can only run them in the directory containing the playlists. 
+With [uv](https://docs.astral.sh/uv/), you don't need `python3-yaml`; run it from the
+repository with `uv run music ...`. mpv and yt-dlp are still installed as above.
+`ffmpeg` is optional; with it, downloaded files get title/artist/album tags.
 
-## Commands and Aliases
+For the tested WSL2/WSLg setup and audio troubleshooting, see [WSL.md](WSL.md).
 
-### Playback Control
+## Two ways to use it
+
+- **Interactive:** run `music` with no arguments. Paste a link or use commands
+  with history and Tab completion. Starting a playlist opens the playlist view.
+  Leaving it with `quit` or Ctrl-D does not stop the music or downloads.
+- **One-shot:** `music play 3`, `music next`, `music pause`. Useful for key
+  bindings and scripts. Both modes run the same commands.
+
+`music --help` lists every command. `music <command> --help` (or `help <command>`
+inside the shell) shows the details for one command.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `open URL` (or paste a bare URL in the shell) | Save the whole playlist, download audio in the background, and play. |
+| `download URL\|ALBUM [-o DIR]` (`dl`, `-dl`) | Download a playlist, song or library album to the music folder without playing. |
+| `add URL` | Add an album/playlist or a single song. The URL type is detected (see below). |
+| `list [WORDS]` (`ls`) | Numbered library: albums first, then songs. Words filter it. |
+| `show [ALBUM]` (`tracks`) | Track list of an album, or of what's playing. |
+| `play [ALBUM] [-t N]` | Play an album front to back, optionally from track N. With no album it resumes a paused track, or opens a picker. |
+| `random` (`rand`) | Play a random album, in order. |
+| `random --songs` | Shuffle every song in the library. |
+| `shuffle [ALBUM]` | Shuffle one album's tracks (default: the current album). |
+| `pause` (`toggle`) | Pause or resume. |
+| `next` (`n`) / `prev` | Next track / restart the track, or go back if within 5s of its start. |
+| `track N` (`jump`) | Jump to track N. |
+| `seek +30` / `seek -10` / `seek 1:30` | Relative or absolute seek. |
+| `volume [70\|+10\|-10]` (`vol`) | Show or set the volume. |
+| `status` (`st`) | One-shot "now playing". |
+| `now` (`np`) | Scrollable active playlist with current song and download status. |
+| `stop` | Stop playback and cancel background downloads. |
+| `restart-audio` (`audio-reset`) | Restart audio in the background and restore the current song; `--player-only` restarts only mpv. |
+| `remove ALBUM` (`rm`) | Remove from the library (asks first). |
+| `edit` | Open the library in `$EDITOR`. |
+| `import-txt FILE...` | Convert old `label \| url` playlist files to albums. |
+| `doctor` | Check dependencies, library and paths. |
+
+**ALBUM** can be the number from `list`, or any words from the artist and title
+(`play gettin`, `play people stairs 2`). If several albums match, you get a
+picker: `fzf` if it's installed, otherwise a numbered menu.
+
+### Live view keys (`now`)
+
+| Key | Action |
+| --- | --- |
+| `space` | Pause / resume |
+| `n` / `p` | Next / previous track |
+| `←` / `→` | Seek 10s back / forward |
+| `↑` / `↓` | Move the playlist selection |
+| `Enter` | Play the selected track (waits for its download if necessary) |
+| `PgUp` / `PgDn`, `Home` / `End` | Scroll pages, or select the first / last track |
+| `g` | Move selection to the current song |
+| `+` / `-` | Volume up / down |
+| `1`–`9` | Jump to that track |
+| `a` | Paste another playlist or song URL |
+| `r` | Restart audio and restore playback |
+| `q` | Return to the prompt (music and downloads keep running) |
+
+## Adding music
+
+Pasting a bare URL or using `open URL` saves and plays immediately. Playlist
+links always load their whole playlist in this workflow. Existing library
+entries and downloaded audio are reused.
+
+`music add URL` keeps the explicit library-management workflow. It asks
+`yt-dlp` for the metadata, then
+shows you what it found and asks before saving:
+
+| Link | Saved as |
+| --- | --- |
+| `youtube.com/playlist?list=…` or `music.youtube.com/browse/MPREb…` | Album: title, artist, year, all tracks |
+| `watch?v=…` / `youtu.be/…` | Song |
+| `watch?v=…&list=OLAK5uy_…` (a track opened from an album) | Asks. The default is the whole album. |
+| `watch?v=…&list=PL…` (a track inside a playlist) | Asks. The default is just the song. |
+| `watch?v=…&list=RD…` (a YouTube mix/radio) | Song |
+| Other sites supported by yt-dlp (e.g. Bandcamp) | Album or song, whichever yt-dlp reports |
+
+Overrides: `--album`, `--song`, `--title "…"`, `--artist "…"`. Use `-y` to skip
+the confirmation, and `--play` to start playing it right away.
+
+The best source is the album playlist from YouTube Music. Open the album on
+music.youtube.com and copy the page URL, or use Share on the album. Those links
+include the proper artist and year.
+
+## Downloading without playing
+
+`music download` (also `dl` or `-dl`) saves audio to the music folder and exits.
+It does not play anything, so it works in scripts and cron jobs:
+
 ```bash
-# Play a specific song
-play_song 3        # Full command
-mx 3              # Quick alias
-                  # Both play the third song in playlist
-
-play_song drake_2  # Full command
-mx drake_2        # Quick alias
-                  # Both play song matching "drake_2"
-
-# Next song
-next_song         # Full command
-mn               # Quick alias
-
-# Previous song
-previous_song     # Full command
-mp               # Quick alias
-
-# Toggle play/pause
-toggle_pause      # Full command
-mt               # Quick alias
-
-# Shuffle play
-shuffle_play      # Full command
-msh              # Quick alias
+music -dl 'https://www.youtube.com/playlist?list=OLAK5uy_...'   # a new playlist (saved to the library too)
+music dl gettin                                                 # an album already in the library
+music dl 3 -o ~/Music                                           # a different folder, this time only
 ```
 
-### Status and Information
+Files that are already there are skipped. If YouTube refuses a track (for
+example `HTTP Error 403`), the command finishes the others and exits non-zero;
+run it again to retry. Tracks played with an older version of `music`, which
+lived in `~/.cache/music-player/`, are copied over instead of downloaded again.
+
+The music folder is, in order: `-o DIR`, `$MUSIC_DOWNLOAD_DIR`, `music_dir` in
+the library's `settings`, then `/mnt/c/dev/music` (or `~/Music` when there is
+no `/mnt/c`). Tracks are found again by the `[id]` in their name, inside the
+folder named from the library's artist, title and year. If you rename an album
+in the library, its songs download again into a new folder.
+
+## The library file
+
+The library is `library.yaml`, next to the script. You can point elsewhere with
+`--library FILE` or `MUSIC_LIBRARY=/path/file.yaml`. The file is git-ignored,
+so your collection stays out of the repo. See
+[library.example.yaml](library.example.yaml) for its structure:
+
+```yaml
+settings:                 # optional
+  mpv_args: [--ao=pulse]  # extra mpv flags
+  volume: 80              # starting volume
+  music_dir: /mnt/c/dev/music   # where downloaded songs are kept
+
+albums:
+  - title: The Gettin' Off Stage, Step 2
+    artist: People Under The Stairs
+    year: 2016
+    url: https://www.youtube.com/playlist?list=OLAK5uy_...
+    tracks:
+      - title: Back from the Dead
+        url: https://www.youtube.com/watch?v=zK_-8YpVxkg
+        duration: 369
+
+songs:
+  - title: Never Gonna Give You Up
+    artist: Rick Astley
+    url: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+It is plain YAML, so you can reorder tracks, fix titles or delete entries by
+hand. `music` re-reads it on every command. Only `title` and `url` are
+required. When `add` or `remove` rewrites the file, comments you added by hand
+are lost.
+
+## How it works
+
+`play` starts a detached download coordinator and an `mpv` process. `yt-dlp`
+downloads one track at a time to the music folder (see
+[Downloading without playing](#downloading-without-playing)), preferring m4a
+audio. Only completed local files are handed to mpv.
+The first ready track starts immediately; playback continues in playlist order,
+waiting when the next download is still running. Unavailable tracks are marked
+`failed`, show an error when selected, and are skipped during automatic playback.
+Completed downloads are reused on future plays and remain after `stop`.
+Songs already in the old `~/.cache/music-player/` cache still play from there.
+
+You control playback over mpv's JSON IPC socket at
+`$XDG_RUNTIME_DIR/music-player.sock`, so any terminal can control the same
+playback. The queue and shell history are kept in `~/.local/state/music-player/`.
+mpv's output goes to `mpv.log` in that folder. Download and worker logs live
+under `jobs/` there. Starting another playlist cancels the previous download
+job before creating the new one. `doctor` prints the cache and log locations.
+The playlist view observes playback over a background connection, so an
+unresponsive mpv does not block keyboard navigation or quitting the view.
+
+## Verification
+
 ```bash
-# Show live status with progress bar
-show_live_status  # Full command
-ms               # Quick alias
-
-# List all songs
-list_songs       # Full command
-ml               # Quick alias
-
-# List all playlists
-list_playlists   # Full command
-mpl              # Quick alias
+python3 -m unittest discover -s tests -v     # or: uv run python -m unittest discover -s tests -v
 ```
 
-### Navigation
-```bash
-# Skip forward 30 seconds
-seek_forward     # Full command
-mf              # Quick alias
-
-# Skip backward 30 seconds
-seek_backward    # Full command
-mb              # Quick alias
-
-# Seek to specific time or relative position
-seek 1:30       # Jump to 1 minute 30 seconds
-seek +30        # Skip forward 30 seconds
-seek -30        # Skip backward 30 seconds
-```
-
-### Playlist Management
-```bash
-# Switch playlist
-switch_playlist rock  # Full command
-msw rock            # Quick alias
-
-# Create new playlist
-create jazz         # Creates jazz.txt
-```
-
-### Volume Control
-```bash
-# Adjust volume
-adjust_volume +10   # Full command
-```
-
-## Using Playlists
-
-### Playlist Format
-Create playlist files (*.txt) with this format:
-```
-song_name | https://www.youtube.com/watch?v=...
-another_song | https://www.youtube.com/watch?v=...
-```
-- One song per line
-- The name of the song can be whatever string you like
-- Use | to separate label from URL
-- Labels can contain spaces
-- URLs must be valid YouTube links
-
-### Managing Multiple Playlists
-- All playlists are .txt files in the same directory
-- Switch between playlists using `msw` or `switch_playlist`
-- Create new playlists using `create`
-- Edit playlists with any text editor
-
-## Live Status Display
-Press `ms` (or `show_live_status`) to see:
-```
-Now Playing: Current Song Title
-[1:23 / 3:45] [===============>                    ]
-```
-- Shows current track name
-- Shows time position / total duration
-- Shows visual progress bar
-- Press 'q' to exit display
-
-## Tips
-- Partial matches work for song labels (`mx dra` finds "drake")
-- Live status (`ms`) is great for longer tracks
-- Run `help` to see all commands and examples
+The integration checks use real mpv with silent audio output, isolated temporary
+state/cache/library paths, and an offline yt-dlp fixture. They cover playback
+advancing between downloads, cache reuse, unavailable tracks, download
+cancellation, and pasting/navigating a 25-track playlist in a terminal.
+They also cover keyboard responsiveness with a stalled player and preserving
+downloaded tracks when the audio device is unavailable.
+Recovery checks cover paused playback, position and volume restoration,
+replacing a stalled mpv, background recovery, duplicate requests, and service
+restart failures. The WSL service is simulated in the automated tests.
 
 ## Troubleshooting
-- For socket errors, try `stop_playback` first
-- If live display looks wrong, resize your terminal window
 
-## Getting Help
-Run `help` in the terminal to see:
-- All available commands
-- All aliases
-- Usage examples
-- Tips and tricks
-
-Run `hlp` to get a concise shortcut to see the available aliases.
+- `music doctor` shows what's missing and where the socket and logs are.
+- If downloads fail, inspect the selected track's error and its log under
+  `~/.local/state/music-player/jobs/`. An outdated yt-dlp can cause YouTube
+  failures: run `yt-dlp -U`. Check `mpv.log` for playback errors.
+- If you hear nothing, check the system volume and output device. On WSL, see
+  [WSL.md](WSL.md).
+- An audio-device initialization error stops playback without skipping the
+  whole playlist. Press **r** to restart audio and retry playback. Downloaded
+  files remain cached. Details are in `mpv.log` and `audio-restart.log`.
 
 ## Legal Notice
-This tool is provided for personal use only. Users are responsible for complying with YouTube's Terms of Service and all applicable copyright laws. The script facilitates playback of YouTube content through legal open-source tools (mpv and youtube-dl) but does not download, store, or redistribute any copyrighted content. Please respect content creators' rights and YouTube's terms of service when using this tool.
+This tool downloads and caches audio for personal playback. Use it only for
+content you have permission to download, and comply with applicable copyright
+laws and the source site's terms.

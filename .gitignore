@@ -1,1 +1,7 @@
 *.txt
+library.yaml
+*.yaml.tmp
+__pycache__/
+.venv/
+*.egg-info/
+build/
