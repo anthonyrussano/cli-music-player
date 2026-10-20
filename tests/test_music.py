@@ -398,6 +398,22 @@ sys.exit({int(fail)})
         with self.assertRaises(ProcessLookupError):
             os.kill(download_pid, 0)
 
+    def test_stop_and_play_recover_from_worker_that_died_without_cleanup(self):
+        self.open()
+        queue = self.wait_for(lambda q: q.get("playing_index") == 0)
+        # Simulate WSL shutting down: worker and mpv vanish, the running marker stays.
+        os.kill(queue["worker_pid"], signal.SIGKILL)
+        os.kill(queue["pid"], signal.SIGKILL)
+        self.wait_for(lambda _: not music.owns_worker(queue["worker_pid"], queue["job_dir"]))
+        Path(queue["job_dir"], "running").touch()
+        result = self.cli("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("still stopping", result.stdout + result.stderr)
+        self.assertFalse(Path(queue["job_dir"], "running").exists())
+        self.assertIsNone(self.queue().get("worker_pid"))
+        self.assertEqual(self.cli("play", "fixture").returncode, 0)
+        self.wait_for(lambda q: q.get("job_dir") != queue["job_dir"] and q.get("playing_index") == 0)
+
     def test_replacing_playlist_cancels_old_job_and_preserves_new_queue(self):
         self.env.update(TEST_DELAY_2="8", TEST_LENGTH="12")
         self.open()

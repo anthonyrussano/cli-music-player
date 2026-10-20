@@ -465,14 +465,19 @@ class Player:
 
     def stop(self):
         queue = load_queue()
-        if queue.get("worker_pid") and Path(queue["job_dir"], "running").exists():
+        running = Path(queue["job_dir"], "running") if queue.get("job_dir") else None
+        if (queue.get("worker_pid") and running and running.exists()
+                and not owns_worker(queue["worker_pid"], queue["job_dir"])):
+            # The worker died without cleaning up (e.g. WSL shut down); nothing will remove this.
+            running.unlink(missing_ok=True)
+        if queue.get("worker_pid") and running and running.exists():
             try:
                 os.kill(queue["worker_pid"], signal.SIGTERM)
             except OSError:
                 pass
             # The worker handles SIGTERM and reaps its active downloader.
             for _ in range(100):
-                if not Path(queue["job_dir"], "running").exists():
+                if not running.exists():
                     break
                 time.sleep(0.05)
             else:
@@ -497,6 +502,8 @@ class Player:
         current = load_queue()
         if current.get("job_dir") == queue.get("job_dir") and current:
             current["stopped"] = True
+            if not owns_worker(current.get("worker_pid"), current.get("job_dir")):
+                current["worker_pid"] = None
             save_queue(current)
 
     def start(self, tracks, start_index=0, extra_args=(), volume=None):
@@ -539,6 +546,17 @@ def owns_mpv(pid, socket_path):
         return (Path(os.fsdecode(args[0])).name == "mpv"
                 and os.fsencode(f"--input-ipc-server={socket_path}") in args)
     except (OSError, IndexError):
+        return False
+
+
+def owns_worker(pid, job_dir):
+    """True if `pid` is still the download worker for `job_dir` (not a dead or reused pid)."""
+    if not isinstance(pid, int) or pid <= 0 or not job_dir:
+        return False
+    try:
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        return b"_download" in args and os.fsencode(str(job_dir)) in args
+    except OSError:
         return False
 
 
