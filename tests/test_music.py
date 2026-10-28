@@ -19,6 +19,7 @@ import termios
 import threading
 import time
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader("music", str(ROOT / "music"))
@@ -61,6 +62,17 @@ class SelectionTests(unittest.TestCase):
             self.assertLess(selected, end)
             self.assertLessEqual(end - offset, 12)
 
+    def test_mix_links_load_the_whole_mix_from_their_watch_url(self):
+        url = "https://www.youtube.com/watch?v=LL5InRlT01Q&list=RDEMRz-Jp9Uy2ypI0zU-Bkr1oQ&start_radio=1"
+        kind, list_id = music.classify_url(url)
+        self.assertEqual(kind, "ambiguous")
+        # YouTube calls mixes "unviewable" as playlist?list= pages.
+        self.assertEqual(music.playlist_url(url, list_id),
+                         "https://www.youtube.com/watch?v=LL5InRlT01Q&list=RDEMRz-Jp9Uy2ypI0zU-Bkr1oQ")
+        self.assertEqual(music.playlist_url("https://youtu.be/abc?list=RDabc", "RDabc"),
+                         "https://www.youtube.com/watch?v=abc&list=RDabc")
+        self.assertEqual(music.playlist_url(url, "PLfixture"), "https://www.youtube.com/playlist?list=PLfixture")
+
     def test_ipc_deadline_is_bounded_even_with_unrelated_events(self):
         with tempfile.TemporaryDirectory(prefix="ipc-test-") as directory:
             socket_path = str(Path(directory) / "mpv.sock")
@@ -87,6 +99,49 @@ class SelectionTests(unittest.TestCase):
                 thread.join(timeout=1)
 
 
+class WslgAudioTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="wslg-test-")
+        self.dir = Path(self.tmp.name)
+        for name in ("PulseServer", "PulseAudioRDPSink"):
+            (self.dir / name).touch()
+        (self.dir / "pulseaudio.log").write_text("E: [rdp-sink] RDP Sink - Connected to fd 13\n")
+        patches = [unittest.mock.patch.object(music, "WSLG_DIR", self.dir),
+                   unittest.mock.patch.dict(os.environ, WSL_DISTRO_NAME="Fixture")]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def age(self, name, seconds):
+        stamp = time.time() - seconds
+        os.utime(self.dir / name, (stamp, stamp))
+
+    def test_healthy_and_fresh_boot_are_not_broken(self):
+        self.assertFalse(music.wslg_audio_broken())
+        self.age("PulseServer", 5)  # weston's listener starts a few seconds after PulseAudio
+        self.assertFalse(music.wslg_audio_broken())
+
+    def test_weston_restart_after_pulseaudio_is_broken(self):
+        self.age("PulseServer", 3600)
+        self.assertTrue(music.wslg_audio_broken())
+
+    def test_rdp_sink_send_failure_in_current_log_is_broken(self):
+        self.age("pulseaudio.log", 60)
+        (self.dir / "pulseaudio.log.1").write_text("E: [rdp-sink] data_send: send failed sent -1 bytes 10584\n")
+        self.assertTrue(music.wslg_audio_broken())
+        # A newer PulseAudio (after a restart) has its own clean log.
+        (self.dir / "pulseaudio.log.2").write_text("E: [rdp-sink] RDP Sink - Connected to fd 21\n")
+        self.assertFalse(music.wslg_audio_broken())
+        self.assertTrue(music.wslg_sink_connected(time.time() - 5))
+
+    def test_outside_wsl_is_never_broken(self):
+        self.age("PulseServer", 3600)
+        with unittest.mock.patch.dict(os.environ):
+            del os.environ["WSL_DISTRO_NAME"]
+            self.assertFalse(music.wslg_audio_broken())
+
+
 @unittest.skipUnless(shutil.which("mpv"), "mpv required for playback integration checks")
 class PlaybackTests(unittest.TestCase):
     def setUp(self):
@@ -105,7 +160,10 @@ class PlaybackTests(unittest.TestCase):
                         MUSIC_DOWNLOAD_DIR=str(self.base / "music"),
                         MUSIC_LIBRARY=str(self.library), TERM="xterm-256color",
                         TEST_CALLS=str(self.base / "calls.jsonl"),
-                        PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
+                        PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+                        WSLG_DIR=str(self.base / "wslg"))
+        # Automatic recovery must never touch the real WSLg audio service of the machine running tests.
+        self.env.pop("WSL_DISTRO_NAME", None)
         self.queue_path = self.base / "state/music-player/queue.json"
         self.player = music.Player(self.base / "runtime/music-player.sock")
         self.shell = None
@@ -173,9 +231,16 @@ class PlaybackTests(unittest.TestCase):
         wsl = self.base / "bin/wsl.exe"
         wsl.write_text(f'''#!/usr/bin/env python3
 import json, os, sys, time
+from pathlib import Path
 with open(os.environ["TEST_WSL_CALLS"], "a") as fh:
     fh.write(json.dumps(sys.argv[1:]) + "\\n")
 time.sleep({delay})
+wslg = Path(os.environ["WSLG_DIR"])
+if wslg.is_dir() and not {fail!r}:
+    # Like WSLGd: a fresh PulseAudio server and log that reconnects to weston's RDP sink.
+    (wslg / "PulseServer").touch()
+    count = len(list(wslg.glob("pulseaudio.log*")))
+    (wslg / f"pulseaudio.log.{{count}}").write_text("E: [rdp-sink] RDP Sink - Connected to fd 13\\n")
 print("fixture service error" if {fail!r} else "restarted", file=sys.stderr)
 sys.exit({int(fail)})
 ''')
@@ -251,6 +316,13 @@ sys.exit({int(fail)})
         self.wait_for(lambda q: q.get("playing_index") == 0)
         audio_calls = [c for c in self.calls() if "-J" not in c["args"]]
         self.assertEqual(len(audio_calls), 3)
+
+    def test_pasted_mix_plays_every_track(self):
+        result = self.cli("open", "https://www.youtube.com/watch?v=abc&list=RDEMfixture&start_radio=1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queue = self.wait_for(lambda q: q.get("playing_index") == 0)
+        self.assertEqual(len(queue["tracks"]), 3)
+        self.assertEqual(self.calls()[0]["args"][-1], "https://www.youtube.com/watch?v=abc&list=RDEMfixture")
 
     def test_download_saves_to_music_folder_and_playback_reuses_it(self):
         url = "https://www.youtube.com/watch?v=JaTuWOh_0g4&list=PLfixture"
@@ -358,6 +430,81 @@ sys.exit({int(fail)})
         self.assertEqual(self.queue()["job_dir"], new["job_dir"])
         self.assertEqual(self.queue()["playing_index"], 1)
 
+    def test_frozen_player_is_replaced_automatically(self):
+        self.env["TEST_LENGTH"] = "30"
+        self.open()
+        old = self.wait_for(lambda q: q.get("playing_index") == 0 and q.get("resume_state", {}).get("position", 0) > 0.5)
+        os.kill(old["pid"], signal.SIGSTOP)
+        self.wait_for(lambda _: self.recovery().get("state") == "restarting", timeout=music.STALL_SECONDS + 4)
+        self.assertIn("automatically", self.recovery()["message"])
+        self.wait_for(lambda _: self.recovery().get("state") in ("done", "failed"))
+        self.assertEqual(self.recovery()["state"], "done", self.recovery())
+        self.assertFalse(music.owns_mpv(old["pid"], self.player.socket_path))
+        self.assertNotEqual(self.queue()["pid"], old["pid"])
+        self.assertFalse(self.player.get("pause"))
+        self.assertGreater(self.player.get("time-pos"), 0.5)
+
+    def test_crashed_player_is_restarted_automatically(self):
+        self.env["TEST_LENGTH"] = "30"
+        self.open()
+        old = self.wait_for(lambda q: q.get("playing_index") == 0 and q.get("resume_state", {}).get("position", 0) > 0.5)
+        os.kill(old["pid"], signal.SIGKILL)
+        self.wait_for(lambda q: q.get("pid") != old["pid"] and q.get("playing_index") == 0)
+        self.wait_for(lambda _: self.recovery().get("state") == "done")
+        self.assertGreater(self.player.get("time-pos"), 0.5)
+
+    def test_resuming_after_long_pause_restarts_wslg_audio(self):
+        self.env["TEST_LENGTH"] = "30"
+        self.library.write_text("settings:\n  mpv_args: [--ao=null, --audio-display=no]\n"
+                                "  reset_audio_after_pause: 1\n")
+        self.fake_audio_service()
+        self.open()
+        old = self.wait_for(lambda q: q.get("playing_index") == 0 and q.get("resume_state", {}).get("position", 0) > 0.5)
+        self.player.set("pause", True)
+        self.wait_for(lambda q: q.get("resume_state", {}).get("paused") is True)
+        position = self.player.get("time-pos")
+        time.sleep(1.5)
+        self.assertFalse((self.base / "wsl-calls.jsonl").exists())
+        self.player.set("pause", False)
+        self.wait_for(lambda _: self.recovery().get("state") in ("done", "failed"))
+        self.assertEqual(self.recovery()["state"], "done", self.recovery())
+        self.assertEqual(len((self.base / "wsl-calls.jsonl").read_text().splitlines()), 1)
+        self.assertNotEqual(self.queue()["pid"], old["pid"])
+        self.assertFalse(self.player.get("pause"))
+        self.assertAlmostEqual(self.player.get("time-pos"), position, delta=2)
+
+    def test_lost_wslg_connection_restarts_audio_while_playing(self):
+        self.env["TEST_LENGTH"] = "30"
+        wslg = self.base / "wslg"
+        wslg.mkdir()
+        (wslg / "pulseaudio.log").write_text("E: [rdp-sink] RDP Sink - Connected to fd 13\n")
+        (wslg / "PulseServer").touch()
+        (wslg / "PulseAudioRDPSink").touch()
+        # Weston (and with it the RDP audio channel) restarted long after PulseAudio did.
+        old_time = time.time() - 3600
+        os.utime(wslg / "PulseServer", (old_time, old_time))
+        self.fake_audio_service()
+        self.open()
+        self.wait_for(lambda _: self.recovery().get("state") == "done", timeout=15)
+        self.assertEqual(len((self.base / "wsl-calls.jsonl").read_text().splitlines()), 1)
+        self.assertEqual(self.queue()["playing_index"], 0)
+        self.assertFalse(self.player.get("pause"))
+
+    def test_automatic_restarts_give_up_after_repeated_failures(self):
+        self.env["TEST_LENGTH"] = "30"
+        self.fake_audio_service(fail=True)
+        wslg = self.base / "wslg"
+        wslg.mkdir()
+        (wslg / "pulseaudio.log").write_text("E: [rdp-sink] data_send: send failed sent -1 bytes 10584\n")
+        (wslg / "PulseServer").touch()
+        (wslg / "PulseAudioRDPSink").touch()
+        self.queue_path.parent.mkdir(parents=True)
+        (self.queue_path.parent / "audio-auto.json").write_text(json.dumps([time.time()] * music.AUTO_RESTART_LIMIT))
+        self.open()
+        queue = self.wait_for(lambda q: q.get("playback_error"))
+        self.assertIn("automatic audio restarts keep failing", queue["playback_error"])
+        self.assertFalse((self.base / "wsl-calls.jsonl").exists())
+
     def test_failed_track_is_visible_and_skipped(self):
         self.env.update(TEST_FAIL="2", TEST_LENGTH="0.6")
         self.open()
@@ -370,7 +517,7 @@ sys.exit({int(fail)})
         drivers = subprocess.run(["mpv", "--ao=help"], capture_output=True, text=True).stdout
         if "pulse" not in drivers:
             self.skipTest("mpv's PulseAudio driver required for this audio-error check")
-        self.library.write_text("settings:\n  mpv_args: [--ao=pulse]\n")
+        self.library.write_text("settings:\n  mpv_args: [--ao=pulse]\n  auto_recover_audio: false\n")
         self.env["PULSE_SERVER"] = "unix:" + str(self.base / "missing-pulse.sock")
         self.open()
         queue = self.wait_for(lambda q: q.get("playback_error") and all(t["download_status"] == "ready" for t in q["tracks"]))

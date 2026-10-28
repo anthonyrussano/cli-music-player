@@ -5,6 +5,8 @@ settings:
   mpv_args: [--ao=pulse]   # optional extra mpv flags
   volume: 80               # optional starting volume
   music_dir: /mnt/c/dev/music   # optional: where downloaded songs are kept
+  auto_recover_audio: true      # optional: restart audio by itself when it breaks
+  reset_audio_after_pause: 300  # optional (WSL): reconnect audio on resume after this many seconds paused
 
 albums:
   - title: The Gettin' Off Stage, Step 2

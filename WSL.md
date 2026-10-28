@@ -103,8 +103,16 @@ pactl list short sinks
 show `SUSPENDED`; that alone is not an error. Check Windows volume and the
 selected output device if playback advances but you hear nothing.
 
-If audio freezes after pausing or disconnecting, press **r** in the playlist
-view, or run `music restart-audio`. This restarts WSLg's PulseAudio service and
+Audio normally recovers by itself. When WSLg's link to Windows breaks (weston
+restarting, or PulseAudio logging `data_send: send failed` in
+`/mnt/wslg/pulseaudio.log*`), the player restarts WSLg's PulseAudio. It waits
+until PulseAudio logs `RDP Sink - Connected`, then resumes the song, retrying up
+to three times. Resuming after a pause of 5 minutes or more does the same,
+because Windows may have switched devices during a Teams call. Stuck or crashed
+playback is restarted too. See README.md for the settings.
+
+If audio is still silent, press **r** in the playlist view, or run
+`music restart-audio`. This restarts WSLg's PulseAudio service and
 the player, then restores the current song at its last known position with the
 same volume and pause state. It briefly interrupts other WSL audio streams.
 The playlist view stays responsive while recovery runs. A paused song stays

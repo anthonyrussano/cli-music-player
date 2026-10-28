@@ -33,7 +33,7 @@ try:
 except ImportError:
     sys.exit("music: PyYAML is required (Debian/Ubuntu: sudo apt install python3-yaml)")
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 SCRIPT_DIR = Path(os.path.realpath(__file__)).parent
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "music-player"
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or STATE_DIR)
@@ -45,6 +45,12 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "mu
 DEFAULT_MUSIC_DIR = Path("/mnt/c/dev/music")
 AUDIO_RESTART_FILE = STATE_DIR / "audio-restart.json"
 AUDIO_RESTART_LOG = STATE_DIR / "audio-restart.log"
+AUDIO_AUTO_FILE = STATE_DIR / "audio-auto.json"
+# WSLg's audio path: PulseAudio → RDP sink socket (weston) → msrdc.exe on Windows.
+WSLG_DIR = Path(os.environ.get("WSLG_DIR", "/mnt/wslg"))
+STALL_SECONDS = 6            # playing without progress (or no IPC replies) this long means stuck
+AUTO_RESTART_LIMIT = 3       # automatic restarts allowed per window, so a dead device cannot loop
+AUTO_RESTART_WINDOW = 600
 
 
 class MusicError(Exception):
@@ -256,11 +262,23 @@ def classify_url(url):
         is_video = (host == "youtu.be" and len(parsed.path) > 1) or "v" in query \
             or parsed.path.startswith(("/shorts/", "/live/"))
         if is_video:
-            # RD... lists are auto-generated mixes/radios, never albums.
-            if list_id and not list_id.startswith("RD"):
+            if list_id:
                 return "ambiguous", list_id
             return "song", None
     return "unknown", None
+
+
+def playlist_url(url, list_id):
+    """The URL yt-dlp loads a whole list from.
+
+    Mixes/radios (RD...) are generated around a video and are "unviewable" as
+    playlist?list= pages, so they keep their watch URL (without extra tracking params).
+    """
+    if not list_id.startswith("RD"):
+        return f"https://www.youtube.com/playlist?list={list_id}"
+    parsed = urlparse(url)
+    video = (parse_qs(parsed.query).get("v") or [""])[0] or parsed.path.rstrip("/").rsplit("/", 1)[-1]
+    return f"https://www.youtube.com/watch?v={video}&list={list_id}"
 
 
 def run_ytdlp(args):
@@ -366,18 +384,18 @@ def resolve_add(url, force_kind=None):
     kind, list_id = classify_url(url)
     if force_kind:
         if force_kind == "album" and list_id and kind == "ambiguous":
-            url = f"https://www.youtube.com/playlist?list={list_id}"
+            url = playlist_url(url, list_id)
         kind = force_kind
     elif kind == "ambiguous":
         album_like = list_id.startswith("OLAK5uy_")
         if sys.stdin.isatty():
-            what = "an album" if album_like else "a playlist"
+            what = "an album" if album_like else ("a YouTube mix" if list_id.startswith("RD") else "a playlist")
             print(f"This link is a track inside {what}.")
             want_album = confirm("Add the whole album/playlist? (no = just this song)", default=album_like)
         else:
             want_album = album_like
         if want_album:
-            kind, url = "album", f"https://www.youtube.com/playlist?list={list_id}"
+            kind, url = "album", playlist_url(url, list_id)
         else:
             kind = "song"
 
@@ -671,17 +689,30 @@ def audio_restart_status():
         return {}
 
 
-def start_audio_restart(library_path, player_only=False, snapshot=None):
-    """Launch recovery outside the UI; the inherited lock prevents duplicate restarts."""
+def start_audio_restart(library_path, player_only=False, snapshot=None, reason=None):
+    """Launch recovery outside the UI; the inherited lock prevents duplicate restarts.
+
+    Automatic restarts pass a `reason` and are rate limited; None means the limit was hit.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(STATE_DIR / "audio-restart.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return "Audio restart already in progress."
+        if reason:
+            now = time.time()
+            try:
+                recent = [t for t in json.loads(AUDIO_AUTO_FILE.read_text()) if now - t < AUTO_RESTART_WINDOW]
+            except (OSError, ValueError, TypeError):
+                recent = []
+            if len(recent) >= AUTO_RESTART_LIMIT:
+                return None
+            write_json(AUDIO_AUTO_FILE, recent + [now])
         recovery_id = uuid.uuid4().hex
+        message = f"{reason}; restarting audio automatically…" if reason else "Restarting audio…"
         write_json(AUDIO_RESTART_FILE, {"id": recovery_id, "state": "restarting",
-                                       "message": "Restarting audio…", "snapshot": snapshot})
+                                       "message": message, "snapshot": snapshot})
         try:
             with open(AUDIO_RESTART_LOG, "w") as log:
                 subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_restart-audio",
@@ -713,6 +744,46 @@ done
 '''
 
 
+def wslg_pulse_log(since=0):
+    """The running PulseAudio's log; every restart writes a new pulseaudio.log[.N]."""
+    logs = []
+    for path in WSLG_DIR.glob("pulseaudio.log*"):
+        try:
+            if path.stat().st_mtime >= since:
+                logs.append((path.stat().st_mtime, path))
+        except OSError:
+            pass
+    return max(logs)[1] if logs else None
+
+
+def wslg_audio_broken():
+    """True once WSLg's PulseAudio has lost its RDP link to Windows.
+
+    When weston restarts (sleep, RDP reconnect, a device switch) after PulseAudio, or the
+    RDP sink's socket fails, playback keeps running but is silent until PulseAudio restarts.
+    """
+    if not os.environ.get("WSL_DISTRO_NAME"):
+        return False
+    try:
+        server = (WSLG_DIR / "PulseServer").stat().st_mtime
+        sink = (WSLG_DIR / "PulseAudioRDPSink").stat().st_mtime
+        log = wslg_pulse_log()
+        text = log.read_text(errors="replace") if log else ""
+    except OSError:
+        return False
+    # At boot weston's listener appears a few seconds after PulseAudio; that pairing is fine.
+    return sink > server + 30 or bool(re.search(r"send failed|X11 I/O error", text))
+
+
+def wslg_sink_connected(since):
+    log = wslg_pulse_log(since)
+    try:
+        lines = [line for line in log.read_text(errors="replace").splitlines() if "rdp-sink" in line] if log else []
+    except OSError:
+        return False
+    return bool(lines) and "Connected to fd" in lines[-1]
+
+
 def restart_wslg_audio():
     wsl = shutil.which("wsl.exe")
     if not wsl and Path("/mnt/c/Windows/System32/wsl.exe").exists():
@@ -721,6 +792,7 @@ def restart_wslg_audio():
         raise MusicError("WSLg audio restart is unavailable here; use `restart-audio --player-only` to restart mpv")
     if not shutil.which("pactl"):
         raise MusicError("Audio recovery needs pactl; install pulseaudio-utils before retrying")
+    killed_at = time.time() - 1
     result = subprocess.run([wsl, "--system", "--cd", "/", "--exec", "sh", "-c", RESTART_WSLG_AUDIO],
                             capture_output=True, timeout=8)
     if result.returncode:
@@ -732,11 +804,21 @@ def restart_wslg_audio():
         try:
             probe = subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=1)
             if probe.returncode == 0:
-                return
+                break
         except subprocess.TimeoutExpired:
             pass
         time.sleep(0.2)
-    raise MusicError("WSLg audio is still unavailable after restart; see audio-restart.log")
+    else:
+        raise MusicError("WSLg audio is still unavailable after restart; see audio-restart.log")
+    if not (WSLG_DIR / "PulseAudioRDPSink").exists():
+        return
+    # PulseAudio retries its RDP connection every 5 s; until then everything plays silently.
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        if wslg_sink_connected(killed_at):
+            return
+        time.sleep(0.2)
+    raise MusicError("WSLg audio restarted but did not reconnect to Windows yet")
 
 
 def recover_audio(library_path, player_only, recovery_id):
@@ -762,34 +844,56 @@ def recover_audio(library_path, player_only, recovery_id):
         for key, default in (("position", 0), ("paused", False), ("volume", None)):
             restore[key] = next((values[key] for values in (snapshot, live, saved)
                                  if values.get(key) is not None), default)
-        if not player_only:
-            report("restarting", "Restarting WSLg audio service…")
-            restart_wslg_audio()
-        current = load_queue()
-        if (current.get("job_dir") != queue.get("job_dir")
-                or (current.get("stopped") and not queue.get("stopped"))):
-            report("done", "Audio restarted; playback changed during recovery and was left as selected.")
-            return
-        if not queue.get("tracks"):
-            report("done", "Audio service restarted. No playlist to resume.")
-            return
-        report("restarting", "Reconnecting player and restoring playback…")
-        app.play_tracks(queue["name"], queue.get("artist"), queue["tracks"], index,
-                        queue.get("shuffled", False), restore=restore)
-        restored_job = load_queue().get("job_dir")
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
+
+        def attempt():
+            nonlocal queue
+            if not player_only:
+                report("restarting", "Restarting WSLg audio service…")
+                restart_wslg_audio()
             current = load_queue()
-            if current.get("job_dir") != restored_job or current.get("stopped"):
-                report("done", "Audio restarted; playback was changed or stopped during recovery.")
+            if (current.get("job_dir") != queue.get("job_dir")
+                    or (current.get("stopped") and not queue.get("stopped"))):
+                return "Audio restarted; playback changed during recovery and was left as selected."
+            if not queue.get("tracks"):
+                return "Audio service restarted. No playlist to resume."
+            report("restarting", "Reconnecting player and restoring playback…")
+            app.play_tracks(queue["name"], queue.get("artist"), queue["tracks"], index,
+                            queue.get("shuffled", False), restore=restore)
+            queue = load_queue()
+            started = None
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                current = load_queue()
+                if current.get("job_dir") != queue.get("job_dir") or current.get("stopped"):
+                    return "Audio restarted; playback was changed or stopped during recovery."
+                if current.get("playback_error") or current.get("worker_error"):
+                    raise MusicError(current.get("playback_error") or current["worker_error"])
+                if current.get("playing_index") == index and not current.get("restore"):
+                    if restore["paused"]:
+                        return "Audio restarted; playback restored (paused)."
+                    # Only a moving position proves the new output is accepting audio.
+                    position = app.player.get("time-pos")
+                    if started is None:
+                        started = position
+                    elif position is not None and position >= started + 0.5:
+                        return "Audio restarted; playback restored."
+                elif started is not None:
+                    return "Audio restarted; playback restored."  # already advanced to the next song
+                time.sleep(0.1)
+            raise MusicError("Audio restarted, but playback has not recovered yet; select a ready song to retry")
+
+        # Windows may still be switching devices (e.g. a Teams call ending); retry like a person would.
+        attempts = 2 if player_only else 3
+        for number in range(1, attempts + 1):
+            try:
+                report("done", attempt())
                 return
-            if current.get("playback_error") or current.get("worker_error"):
-                raise MusicError(current.get("playback_error") or current["worker_error"])
-            if current.get("playing_index") == index and not current.get("restore"):
-                report("done", "Audio restarted; playback restored" + (" (paused)." if restore["paused"] else "."))
-                return
-            time.sleep(0.1)
-        raise MusicError("Audio restarted, but playback has not recovered yet; select a ready song to retry")
+            except (MusicError, subprocess.TimeoutExpired) as exc:
+                if number == attempts:
+                    raise
+                print(f"Attempt {number} failed: {exc}", file=sys.stderr, flush=True)
+                report("restarting", f"Audio did not come back ({exc}); retrying {number + 1}/{attempts}…")
+                time.sleep(2 * number)
     except (MusicError, OSError, subprocess.TimeoutExpired, yaml.YAMLError) as exc:
         report("failed", "Audio restart failed: " + str(exc))
         print(str(exc), file=sys.stderr)
@@ -987,6 +1091,75 @@ class DownloadSession:
         self.cancelled = False
         self.request_id = None
         self.events = None
+        self.watchdog = bool(self.queue.get("auto_recover_audio") and self.queue.get("library"))
+        now = time.monotonic()
+        self.last_reply = self.last_progress = self.last_ping = self.last_check = now
+        self.last_position = None
+        self.paused_since = None
+
+    def auto_recover(self, reason, paused=False):
+        """Restart audio in the background, as pressing r would; False if that is not possible."""
+        if not self.watchdog:
+            return False
+        state = self.queue.get("resume_state") or {}
+        index = self.queue.get("playing_index")
+        if index is None:
+            index = self.queue.get("last_index")
+        snapshot = {"job_dir": str(self.job_dir), "paused": paused, "volume": state.get("volume"),
+                    "position": state.get("position") if state.get("index") == index else None}
+        try:
+            started = start_audio_restart(self.queue["library"], snapshot=snapshot, reason=reason,
+                                          player_only=not os.environ.get("WSL_DISTRO_NAME"))
+        except MusicError:
+            started = None
+        if started is None:
+            # Stop retrying a device that stays broken; r still works.
+            self.watchdog = False
+            self.queue["playback_error"] = f"{reason}, and automatic audio restarts keep failing"
+            self.publish()
+        return bool(started)
+
+    def resumed(self, paused_for):
+        """A long pause (a Teams call, a device switch) often leaves WSLg audio silent."""
+        if self.queue.get("playing_index") is None or not os.environ.get("WSL_DISTRO_NAME"):
+            return
+        threshold = self.queue.get("reset_audio_after_pause")
+        if wslg_audio_broken():
+            reason = "WSLg audio lost its connection to Windows"
+        elif isinstance(threshold, (int, float)) and 0 < threshold <= paused_for:
+            reason = "Resuming after a long pause"
+        else:
+            return
+        if self.auto_recover(reason):
+            self.player.set("pause", True)  # recovery resumes on the fresh output
+
+    def watch(self):
+        """Notice stuck or silent playback and restart audio without waiting for the user."""
+        now = time.monotonic()
+        if now - self.last_ping >= 2:
+            # Paused mpv sends no events; a reply to this proves it is still alive.
+            self.last_ping = now
+            try:
+                self.events.sendall(b'{"command": ["get_property", "pid"]}\n')
+            except OSError:
+                pass  # a full buffer means mpv is wedged; a dead socket is handled as EOF
+        if not self.watchdog or now - self.last_check < 1:
+            return
+        self.last_check = now
+        if audio_restart_status().get("state") == "restarting":
+            self.last_reply = self.last_progress = now
+            return
+        playing = (self.queue.get("playing_index") is not None and not self.queue.get("restore")
+                   and self.paused_since is None)
+        if now - self.last_reply > STALL_SECONDS:
+            self.auto_recover("The player stopped responding", paused=self.paused_since is not None)
+        elif playing and now - self.last_progress > STALL_SECONDS:
+            self.auto_recover("Playback stalled")
+        elif playing and wslg_audio_broken():
+            self.auto_recover("WSLg audio lost its connection to Windows")
+        else:
+            return
+        self.last_reply = self.last_progress = now
 
     def publish(self):
         # A replaced session must never overwrite the new active queue.
@@ -1055,11 +1228,14 @@ class DownloadSession:
                 if ready:
                     chunk = self.events.recv(65536)
                     if not chunk:
+                        # Stopping always ends this worker first, so mpv vanishing here is a crash.
+                        self.auto_recover("The player exited unexpectedly", paused=self.paused_since is not None)
                         break
                     event_buffer += chunk
                     while b"\n" in event_buffer:
                         line, event_buffer = event_buffer.split(b"\n", 1)
                         event = json.loads(line)
+                        now = self.last_reply = time.monotonic()
                         if event.get("event") == "property-change" and event.get("data") is not None:
                             state = self.queue.setdefault("resume_state", {})
                             key = {"time-pos": "position", "pause": "paused", "volume": "volume"}.get(event.get("name"))
@@ -1067,6 +1243,13 @@ class DownloadSession:
                                 state[key] = event["data"]
                                 if key == "position":
                                     state["index"] = self.queue.get("playing_index")
+                            if key == "position" and event["data"] != self.last_position:
+                                self.last_position, self.last_progress = event["data"], now
+                            elif key == "paused" and event["data"] and self.paused_since is None:
+                                self.paused_since = now
+                            elif key == "paused" and not event["data"] and self.paused_since is not None:
+                                paused_for, self.paused_since, self.last_progress = now - self.paused_since, None, now
+                                self.resumed(paused_for)
                         if event.get("event") == "file-loaded" and self.queue.get("restore"):
                             restore = self.queue.pop("restore")
                             self.player.command("seek", max(0, restore.get("position") or 0), "absolute+exact")
@@ -1080,11 +1263,12 @@ class DownloadSession:
                             if index is not None:
                                 error = event.get("file_error") or "mpv could not play the downloaded file"
                                 if error == "audio output initialization failed":
-                                    # A broken output device affects all songs. Keep their cache/status
-                                    # and wait for an explicit selection to retry after it is fixed.
+                                    # A broken output device affects all songs. Keep their cache/status,
+                                    # restart audio, and otherwise wait for an explicit selection to retry.
                                     self.queue.update(playing_index=None, waiting_index=None,
                                                       playback_error=error)
                                     self.publish()
+                                    self.auto_recover("Audio output failed to start")
                                     continue
                                 if event["reason"] == "error":
                                     self.queue["tracks"][index].update(download_status="failed", error=error)
@@ -1117,6 +1301,7 @@ class DownloadSession:
                         if self.queue.get("restore"):
                             self.player.set("pause", True)
                         self.player.command("loadfile", track["local_path"], "replace")
+                        self.last_progress = time.monotonic()
                         if not self.queue.get("restore"):
                             self.player.set("pause", False)
                             self.queue.setdefault("resume_state", {}).update(index=waiting, position=0, paused=False)
@@ -1130,6 +1315,7 @@ class DownloadSession:
                 if time.monotonic() - last_snapshot >= 1:
                     self.publish()
                     last_snapshot = time.monotonic()
+                self.watch()
         except Exception as exc:
             self.queue["worker_error"] = str(exc)
             self.publish()
@@ -1452,7 +1638,11 @@ class App:
         save_queue({"name": name, "artist": artist, "tracks": prepared,
                     "shuffled": shuffled, "pid": pid, "job_dir": str(job_dir),
                     "playing_index": None, "waiting_index": start, "last_index": start,
-                    "finished": False, "restore": restore, "resume_state": restore or {}})
+                    "finished": False, "restore": restore, "resume_state": restore or {},
+                    # The worker restarts audio by itself; see DownloadSession.watch.
+                    "library": str(self.library_path.resolve()),
+                    "auto_recover_audio": settings.get("auto_recover_audio", True) is not False,
+                    "reset_audio_after_pause": settings.get("reset_audio_after_pause", 300)})
         (job_dir / "running").touch()
         with open(job_dir / "worker.log", "w") as log:
             worker = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_download", str(job_dir)],
@@ -1487,7 +1677,7 @@ class App:
             raise MusicError("Paste an http:// or https:// playlist/song URL")
         kind, list_id = classify_url(url)
         if list_id and kind == "ambiguous":
-            url = f"https://www.youtube.com/playlist?list={list_id}"
+            url = playlist_url(url, list_id)
             kind = "album"
         lib = self.lib
         item = next((it for it in lib.items() if it[1].get("url") == url), None)

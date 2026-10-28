@@ -1,6 +1,6 @@
 [project]
 name = "music"
-version = "2.2.0"
+version = "2.3.0"
 description = "Play and download YouTube albums and playlists from the terminal (mpv + yt-dlp)"
 readme = "README.md"
 requires-python = ">=3.10"

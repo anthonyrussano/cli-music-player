@@ -23,6 +23,8 @@ music › https://www.youtube.com/watch?v=JaTuWOh_0g4&list=PLbmTrF3K6gB1q26lgBX8
 ```
 
 A link containing both a video and a playlist loads the **entire playlist**.
+This includes YouTube mixes (`list=RD…`). A mix is saved as it was when you
+pasted it; YouTube generates a new one each time.
 It opens a full-screen view showing the active song, playback progress, and
 every track's download status. Use **↑/↓** to browse and **Enter** to play the
 selected song. Longer playlists scroll; **PgUp/PgDn** and **Home/End** reach
@@ -34,10 +36,28 @@ Press **a** in the view to paste another link, or **q** to return to the command
 prompt. `now` reopens the view. `stop` cancels downloads and stops playback.
 Leaving the shell keeps playback and downloads running.
 
-If audio freezes or shows an output initialization error, press **r** to restart
-audio. Recovery runs in the background and restores the current song, last
-known position, volume, and pause state. The queue and completed downloads are
-reused. If it restores a paused song, press Space to resume.
+Audio recovers by itself. While a playlist is active, the background worker
+restarts audio and puts the current song back at the same position when:
+
+- playback is stuck (the position stops moving for 6 seconds), or mpv stops
+  responding or crashes;
+- the audio output fails to start;
+- on WSL, WSLg's audio connection to Windows breaks. This happens when Windows
+  switches devices, for example between Teams and Bluetooth headphones, or after
+  sleep. It is noticed while playing and when you resume;
+- on WSL, you resume after a pause of 5 minutes or more. Windows may have
+  changed devices in the meantime, so audio is reconnected before resuming
+  (`reset_audio_after_pause`; see [The library file](#the-library-file)).
+
+Each recovery retries up to three times and only reports success once playback
+is moving again. Automatic restarts stop after three in 10 minutes, so a missing
+device does not cause an endless loop. The view then shows the error, and **r**
+still works.
+
+To restart audio by hand, press **r**. Recovery runs in the background and
+restores the current song, last known position, volume, and pause state. The
+queue and completed downloads are reused. If it restores a paused song, press
+Space to resume.
 
 On WSL this restarts WSLg's shared PulseAudio service, briefly interrupting
 other WSL audio streams, then restarts the player. It does not restart Windows,
@@ -56,7 +76,7 @@ music now
 
 ```text
 $ music
-music 2.2.0 — paste a playlist URL or type `help`; Ctrl-D leaves (music keeps playing)
+music 2.3.0 — paste a playlist URL or type `help`; Ctrl-D leaves (music keeps playing)
 music › add https://www.youtube.com/playlist?list=OLAK5uy_n3hzWL4YDrVBv1fVtpv9HbhkpRnwWbIbw
 Album: The Gettin' Off Stage, Step 2 (2016) — People Under The Stairs
    1. Back from the Dead  6:09
@@ -168,7 +188,7 @@ shows you what it found and asks before saving:
 | `watch?v=…` / `youtu.be/…` | Song |
 | `watch?v=…&list=OLAK5uy_…` (a track opened from an album) | Asks. The default is the whole album. |
 | `watch?v=…&list=PL…` (a track inside a playlist) | Asks. The default is just the song. |
-| `watch?v=…&list=RD…` (a YouTube mix/radio) | Song |
+| `watch?v=…&list=RD…` (a YouTube mix/radio) | Asks. The default is just the song. |
 | Other sites supported by yt-dlp (e.g. Bandcamp) | Album or song, whichever yt-dlp reports |
 
 Overrides: `--album`, `--song`, `--title "…"`, `--artist "…"`. Use `-y` to skip
@@ -212,6 +232,8 @@ settings:                 # optional
   mpv_args: [--ao=pulse]  # extra mpv flags
   volume: 80              # starting volume
   music_dir: /mnt/c/dev/music   # where downloaded songs are kept
+  auto_recover_audio: true      # restart audio by itself when it breaks (default)
+  reset_audio_after_pause: 300  # WSL: reconnect audio on resume after this many seconds paused; 0 = never
 
 albums:
   - title: The Gettin' Off Stage, Step 2
@@ -269,7 +291,10 @@ They also cover keyboard responsiveness with a stalled player and preserving
 downloaded tracks when the audio device is unavailable.
 Recovery checks cover paused playback, position and volume restoration,
 replacing a stalled mpv, background recovery, duplicate requests, and service
-restart failures. The WSL service is simulated in the automated tests.
+restart failures. Automatic recovery is checked for a frozen and a crashed mpv,
+resuming after a long pause, a lost WSLg connection, and giving up after
+repeated failures. The WSL service and its logs are simulated in the automated
+tests; the real one is never touched.
 
 ## Troubleshooting
 
@@ -280,8 +305,9 @@ restart failures. The WSL service is simulated in the automated tests.
 - If you hear nothing, check the system volume and output device. On WSL, see
   [WSL.md](WSL.md).
 - An audio-device initialization error stops playback without skipping the
-  whole playlist. Press **r** to restart audio and retry playback. Downloaded
-  files remain cached. Details are in `mpv.log` and `audio-restart.log`.
+  whole playlist, and audio restarts automatically. If that keeps failing, fix
+  the device and press **r**. Downloaded files remain cached. Details are in
+  `mpv.log` and `audio-restart.log`.
 
 ## Legal Notice
 This tool downloads and caches audio for personal playback. Use it only for
